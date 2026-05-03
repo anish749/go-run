@@ -27,11 +27,10 @@ import (
 // Runtime is the Cloud Run-injected runtime info. A non-nil *Runtime
 // guarantees every field is populated; nil means the process is running
 // locally. The presence of K_SERVICE is the disjunction tag — Cloud Run
-// always injects all three K_* variables together.
+// injects K_SERVICE and K_REVISION together.
 type Runtime struct {
-	Service       string // K_SERVICE
-	Revision      string // K_REVISION
-	Configuration string // K_CONFIGURATION
+	Service  string // K_SERVICE
+	Revision string // K_REVISION
 }
 
 // Env is the resolved runtime environment of a service.
@@ -63,10 +62,10 @@ func (e Env) IsCloudRun() bool {
 // Locally, set GOOGLE_CLOUD_PROJECT in your shell or .env. On Cloud Run,
 // leave it unset and the metadata server provides the value automatically.
 //
-// PORT defaults to 8080 if unset, matching Cloud Run's default. K_SERVICE,
-// K_REVISION, and K_CONFIGURATION are read together; if any one is set,
-// all three must be (Cloud Run always injects them together — a partial
-// set indicates a misconfigured environment and returns an error).
+// PORT defaults to 8080 if unset, matching Cloud Run's default. K_SERVICE
+// and K_REVISION are read together; if one is set, both must be (Cloud Run
+// always injects them together — a partial set indicates a misconfigured
+// environment and returns an error).
 func LoadEnv(ctx context.Context) (Env, error) {
 	port, err := readPort()
 	if err != nil {
@@ -102,23 +101,21 @@ func readPort() (int, error) {
 func readRuntime() (*Runtime, error) {
 	service := os.Getenv("K_SERVICE")
 	revision := os.Getenv("K_REVISION")
-	configuration := os.Getenv("K_CONFIGURATION")
 
-	anySet := service != "" || revision != "" || configuration != ""
-	allSet := service != "" && revision != "" && configuration != ""
+	anySet := service != "" || revision != ""
+	bothSet := service != "" && revision != ""
 	if !anySet {
 		return nil, nil
 	}
-	if !allSet {
+	if !bothSet {
 		return nil, fmt.Errorf(
-			"cloudrun: partial Cloud Run runtime variables: K_SERVICE=%q K_REVISION=%q K_CONFIGURATION=%q (Cloud Run injects all three together)",
-			service, revision, configuration,
+			"cloudrun: partial Cloud Run runtime variables: K_SERVICE=%q K_REVISION=%q (Cloud Run injects both together)",
+			service, revision,
 		)
 	}
 	return &Runtime{
-		Service:       service,
-		Revision:      revision,
-		Configuration: configuration,
+		Service:  service,
+		Revision: revision,
 	}, nil
 }
 

@@ -50,7 +50,7 @@ func stubMetadataServer(t *testing.T, projectID string) {
 }
 
 func TestLoadEnv_Local(t *testing.T) {
-	unsetEnv(t, "PORT", "K_SERVICE", "K_REVISION", "K_CONFIGURATION")
+	unsetEnv(t, "PORT", "K_SERVICE", "K_REVISION")
 	t.Setenv("GOOGLE_CLOUD_PROJECT", "test-project")
 
 	got, err := cloudrun.LoadEnv(context.Background())
@@ -78,7 +78,6 @@ func TestLoadEnv_OnCloudRun(t *testing.T) {
 	t.Setenv("PORT", "9090")
 	t.Setenv("K_SERVICE", "my-service")
 	t.Setenv("K_REVISION", "my-service-00001-abc")
-	t.Setenv("K_CONFIGURATION", "my-service")
 	stubMetadataServer(t, "from-metadata")
 
 	got, err := cloudrun.LoadEnv(context.Background())
@@ -100,9 +99,6 @@ func TestLoadEnv_OnCloudRun(t *testing.T) {
 	if got.Runtime.Revision != "my-service-00001-abc" {
 		t.Errorf("Revision: got %q", got.Runtime.Revision)
 	}
-	if got.Runtime.Configuration != "my-service" {
-		t.Errorf("Configuration: got %q", got.Runtime.Configuration)
-	}
 	if !got.IsCloudRun() {
 		t.Error("IsCloudRun: got false, want true")
 	}
@@ -110,7 +106,7 @@ func TestLoadEnv_OnCloudRun(t *testing.T) {
 
 func TestLoadEnv_ProjectFromEnvShortCircuitsMetadata(t *testing.T) {
 	// When GOOGLE_CLOUD_PROJECT is set, LoadEnv must not hit the metadata server.
-	unsetEnv(t, "K_SERVICE", "K_REVISION", "K_CONFIGURATION")
+	unsetEnv(t, "K_SERVICE", "K_REVISION")
 	t.Setenv("GOOGLE_CLOUD_PROJECT", "from-env")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected metadata server hit: %s", r.URL.Path)
@@ -129,9 +125,9 @@ func TestLoadEnv_ProjectFromEnvShortCircuitsMetadata(t *testing.T) {
 }
 
 func TestLoadEnv_PartialRuntimeVarsErrors(t *testing.T) {
-	// K_SERVICE alone (without K_REVISION, K_CONFIGURATION) is a misconfigured
-	// environment — must error rather than produce a half-populated Runtime.
-	unsetEnv(t, "K_REVISION", "K_CONFIGURATION")
+	// K_SERVICE alone (without K_REVISION) is a misconfigured environment —
+	// must error rather than produce a half-populated Runtime.
+	unsetEnv(t, "K_REVISION")
 	t.Setenv("GOOGLE_CLOUD_PROJECT", "test-project")
 	t.Setenv("K_SERVICE", "my-service")
 
@@ -145,7 +141,7 @@ func TestLoadEnv_PartialRuntimeVarsErrors(t *testing.T) {
 }
 
 func TestLoadEnv_InvalidPortErrors(t *testing.T) {
-	unsetEnv(t, "K_SERVICE", "K_REVISION", "K_CONFIGURATION")
+	unsetEnv(t, "K_SERVICE", "K_REVISION")
 	t.Setenv("GOOGLE_CLOUD_PROJECT", "test-project")
 	t.Setenv("PORT", "not-a-number")
 
