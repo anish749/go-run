@@ -1,81 +1,134 @@
 // Package cloudrun provides adapters for code running on Google Cloud Run.
 //
-// Env captures the runtime environment variables Cloud Run injects into a
-// service container, plus the GCP project ID that GCP client libraries
-// typically need. It is intended to be embedded in your own config struct:
+// LoadEnv is the single constructor for runtime configuration:
 //
-//	type MyEnv struct {
-//	    cloudrun.Env
-//	    DBURL string `env:"DB_URL,notEmpty"`
-//	}
-//	var cfg MyEnv
-//	if err := env.Parse(&cfg); err != nil { ... }
-//	if err := cloudrun.ResolveProjectID(ctx, &cfg.Env); err != nil { ... }
+//	cloud, err := cloudrun.LoadEnv(ctx)
+//	if err != nil { /* ... */ }
 //
-// The split between env.Parse and ResolveProjectID exists because Cloud Run
-// does not inject GOOGLE_CLOUD_PROJECT — it must come from either the user
-// (locally) or the GCE metadata server (on Cloud Run).
+// The returned Env is always fully populated: Project is resolved (from
+// GOOGLE_CLOUD_PROJECT or the GCE metadata server) and Runtime is either
+// nil (running locally) or fully populated (running on Cloud Run). There is
+// no partially-built middle state to worry about.
+//
+// Service-specific configuration (DB URLs, feature flags, etc.) is parsed
+// independently — typically with caarlos0/env or your config tool of choice
+// — and composed into your service's own Config struct alongside cloudrun.Env.
 package cloudrun
 
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 
 	"cloud.google.com/go/compute/metadata"
 )
 
-// Env holds the runtime environment of a service running on Cloud Run.
+// Runtime is the Cloud Run-injected runtime info. A non-nil *Runtime
+// guarantees every field is populated; nil means the process is running
+// locally. The presence of K_SERVICE is the disjunction tag — Cloud Run
+// always injects all three K_* variables together.
+type Runtime struct {
+	Service       string // K_SERVICE
+	Revision      string // K_REVISION
+	Configuration string // K_CONFIGURATION
+}
+
+// Env is the resolved runtime environment of a service.
 //
-// PORT, K_SERVICE, K_REVISION, and K_CONFIGURATION are injected automatically
-// by Cloud Run. They are empty when the process runs locally (PORT defaults
-// to 8080 here so a local run still has a sensible value).
+// Project is always populated when LoadEnv returns no error.
+// Runtime is nil iff running locally; non-nil iff running on Cloud Run.
 //
-// GOOGLE_CLOUD_PROJECT is NOT injected by Cloud Run. Locally, set it in your
-// shell or .env file. On Cloud Run, leave it unset and call ResolveProjectID
-// to look it up from the metadata server.
+// A zero Env value is never useful — only construct via LoadEnv.
 type Env struct {
-	// Port is the HTTP listen port. Cloud Run injects PORT=8080 by default.
-	Port int `env:"PORT" envDefault:"8080"`
-
-	// Project is the GCP project ID, sourced from GOOGLE_CLOUD_PROJECT.
-	// Empty if neither set in the environment nor resolved via ResolveProjectID.
-	Project string `env:"GOOGLE_CLOUD_PROJECT"`
-
-	// Service is the Cloud Run service name (K_SERVICE). Empty when local.
-	Service string `env:"K_SERVICE"`
-
-	// Revision is the Cloud Run revision name (K_REVISION). Empty when local.
-	Revision string `env:"K_REVISION"`
-
-	// Configuration is the Cloud Run Configuration name (K_CONFIGURATION).
-	// Empty when local.
-	Configuration string `env:"K_CONFIGURATION"`
+	Port    int
+	Project string
+	Runtime *Runtime
 }
 
-// IsRunningOnCloudRun reports whether the process is running on Cloud Run.
-// It infers this from the presence of K_SERVICE, which Cloud Run always sets.
-func (e Env) IsRunningOnCloudRun() bool {
-	return e.Service != ""
+// IsCloudRun reports whether the process is running on Cloud Run.
+// Equivalent to e.Runtime != nil; provided for readability at call sites.
+func (e Env) IsCloudRun() bool {
+	return e.Runtime != nil
 }
 
-// ResolveProjectID populates e.Project if it is empty, by querying the GCE
-// metadata server. The metadata server is reachable from Cloud Run, GCE, GKE,
-// and a few other GCP runtimes; locally it is not, so users must set
-// GOOGLE_CLOUD_PROJECT in their environment.
+// LoadEnv reads the Cloud Run runtime environment and resolves the GCP
+// project ID. It returns a fully-populated Env or an error — never a
+// half-built value.
 //
-// If e.Project is already set this is a no-op. If the metadata server is not
-// reachable and the env var was not set, it returns an error.
+// Project resolution order:
+//  1. GOOGLE_CLOUD_PROJECT environment variable, if set.
+//  2. The GCE metadata server (available on Cloud Run, GCE, GKE, etc.).
 //
-// The metadata server endpoint can be overridden for tests via the
-// GCE_METADATA_HOST environment variable.
-func ResolveProjectID(ctx context.Context, e *Env) error {
-	if e.Project != "" {
-		return nil
+// Locally, set GOOGLE_CLOUD_PROJECT in your shell or .env. On Cloud Run,
+// leave it unset and the metadata server provides the value automatically.
+//
+// PORT defaults to 8080 if unset, matching Cloud Run's default. K_SERVICE,
+// K_REVISION, and K_CONFIGURATION are read together; if any one is set,
+// all three must be (Cloud Run always injects them together — a partial
+// set indicates a misconfigured environment and returns an error).
+func LoadEnv(ctx context.Context) (Env, error) {
+	port, err := readPort()
+	if err != nil {
+		return Env{}, err
+	}
+	runtime, err := readRuntime()
+	if err != nil {
+		return Env{}, err
+	}
+	project, err := resolveProject(ctx)
+	if err != nil {
+		return Env{}, err
+	}
+	return Env{
+		Port:    port,
+		Project: project,
+		Runtime: runtime,
+	}, nil
+}
+
+func readPort() (int, error) {
+	raw := os.Getenv("PORT")
+	if raw == "" {
+		return 8080, nil
+	}
+	p, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("cloudrun: PORT=%q is not a valid integer: %w", raw, err)
+	}
+	return p, nil
+}
+
+func readRuntime() (*Runtime, error) {
+	service := os.Getenv("K_SERVICE")
+	revision := os.Getenv("K_REVISION")
+	configuration := os.Getenv("K_CONFIGURATION")
+
+	anySet := service != "" || revision != "" || configuration != ""
+	allSet := service != "" && revision != "" && configuration != ""
+	if !anySet {
+		return nil, nil
+	}
+	if !allSet {
+		return nil, fmt.Errorf(
+			"cloudrun: partial Cloud Run runtime variables: K_SERVICE=%q K_REVISION=%q K_CONFIGURATION=%q (Cloud Run injects all three together)",
+			service, revision, configuration,
+		)
+	}
+	return &Runtime{
+		Service:       service,
+		Revision:      revision,
+		Configuration: configuration,
+	}, nil
+}
+
+func resolveProject(ctx context.Context) (string, error) {
+	if v := os.Getenv("GOOGLE_CLOUD_PROJECT"); v != "" {
+		return v, nil
 	}
 	proj, err := metadata.ProjectIDWithContext(ctx)
 	if err != nil {
-		return fmt.Errorf("cloudrun: GOOGLE_CLOUD_PROJECT not set and metadata server unreachable: %w", err)
+		return "", fmt.Errorf("cloudrun: GOOGLE_CLOUD_PROJECT not set and metadata server unreachable: %w", err)
 	}
-	e.Project = proj
-	return nil
+	return proj, nil
 }

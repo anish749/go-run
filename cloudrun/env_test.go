@@ -9,12 +9,10 @@ import (
 	"testing"
 
 	"github.com/anish749/go-run/cloudrun"
-	"github.com/caarlos0/env/v11"
 )
 
-// unsetEnv clears the named env vars for the test and restores them after.
-// t.Setenv only sets; this is its missing complement when we need a var to
-// look genuinely unset (e.g. to exercise a default or a metadata fallback).
+// unsetEnv clears named env vars for the test. t.Setenv only sets; this is
+// the missing complement when we need to exercise an "unset" code path.
 func unsetEnv(t *testing.T, keys ...string) {
 	t.Helper()
 	saved := map[string]string{}
@@ -31,81 +29,89 @@ func unsetEnv(t *testing.T, keys ...string) {
 	})
 }
 
-func TestEnv_LocalDefaults(t *testing.T) {
-	unsetEnv(t, "PORT", "K_SERVICE", "K_REVISION", "K_CONFIGURATION", "GOOGLE_CLOUD_PROJECT")
+// stubMetadataServer points GCE_METADATA_HOST at a server that returns the
+// given project ID for the project-id endpoint.
+func stubMetadataServer(t *testing.T, projectID string) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Metadata-Flavor") != "Google" {
+			http.Error(w, "missing Metadata-Flavor header", http.StatusBadRequest)
+			return
+		}
+		if r.URL.Path != "/computeMetadata/v1/project/project-id" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Metadata-Flavor", "Google")
+		_, _ = w.Write([]byte(projectID))
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("GCE_METADATA_HOST", strings.TrimPrefix(srv.URL, "http://"))
+}
 
-	var got cloudrun.Env
-	if err := env.Parse(&got); err != nil {
-		t.Fatalf("env.Parse: %v", err)
+func TestLoadEnv_Local(t *testing.T) {
+	unsetEnv(t, "PORT", "K_SERVICE", "K_REVISION", "K_CONFIGURATION")
+	t.Setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+
+	got, err := cloudrun.LoadEnv(context.Background())
+	if err != nil {
+		t.Fatalf("LoadEnv: %v", err)
 	}
 	if got.Port != 8080 {
 		t.Errorf("Port: got %d, want default 8080", got.Port)
 	}
-	if got.Service != "" {
-		t.Errorf("Service: got %q, want empty (local)", got.Service)
+	if got.Project != "test-project" {
+		t.Errorf("Project: got %q, want test-project", got.Project)
 	}
-	if got.IsRunningOnCloudRun() {
-		t.Error("IsRunningOnCloudRun: got true, want false (no K_SERVICE)")
+	if got.Runtime != nil {
+		t.Errorf("Runtime: got %+v, want nil (local)", got.Runtime)
+	}
+	if got.IsCloudRun() {
+		t.Error("IsCloudRun: got true, want false")
 	}
 }
 
-func TestEnv_OnCloudRun(t *testing.T) {
+func TestLoadEnv_OnCloudRun(t *testing.T) {
+	// Simulate Cloud Run: GOOGLE_CLOUD_PROJECT unset, K_* injected, metadata
+	// server reachable.
+	unsetEnv(t, "GOOGLE_CLOUD_PROJECT")
 	t.Setenv("PORT", "9090")
 	t.Setenv("K_SERVICE", "my-service")
 	t.Setenv("K_REVISION", "my-service-00001-abc")
 	t.Setenv("K_CONFIGURATION", "my-service")
-	t.Setenv("GOOGLE_CLOUD_PROJECT", "my-project")
+	stubMetadataServer(t, "from-metadata")
 
-	var got cloudrun.Env
-	if err := env.Parse(&got); err != nil {
-		t.Fatalf("env.Parse: %v", err)
+	got, err := cloudrun.LoadEnv(context.Background())
+	if err != nil {
+		t.Fatalf("LoadEnv: %v", err)
 	}
 	if got.Port != 9090 {
 		t.Errorf("Port: got %d, want 9090", got.Port)
 	}
-	if got.Service != "my-service" {
-		t.Errorf("Service: got %q, want my-service", got.Service)
+	if got.Project != "from-metadata" {
+		t.Errorf("Project: got %q, want from-metadata", got.Project)
 	}
-	if got.Revision != "my-service-00001-abc" {
-		t.Errorf("Revision: got %q", got.Revision)
+	if got.Runtime == nil {
+		t.Fatal("Runtime: got nil, want populated (on Cloud Run)")
 	}
-	if got.Configuration != "my-service" {
-		t.Errorf("Configuration: got %q", got.Configuration)
+	if got.Runtime.Service != "my-service" {
+		t.Errorf("Service: got %q", got.Runtime.Service)
 	}
-	if got.Project != "my-project" {
-		t.Errorf("Project: got %q, want my-project", got.Project)
+	if got.Runtime.Revision != "my-service-00001-abc" {
+		t.Errorf("Revision: got %q", got.Runtime.Revision)
 	}
-	if !got.IsRunningOnCloudRun() {
-		t.Error("IsRunningOnCloudRun: got false, want true")
+	if got.Runtime.Configuration != "my-service" {
+		t.Errorf("Configuration: got %q", got.Runtime.Configuration)
+	}
+	if !got.IsCloudRun() {
+		t.Error("IsCloudRun: got false, want true")
 	}
 }
 
-func TestEnv_Embedding(t *testing.T) {
+func TestLoadEnv_ProjectFromEnvShortCircuitsMetadata(t *testing.T) {
+	// When GOOGLE_CLOUD_PROJECT is set, LoadEnv must not hit the metadata server.
 	unsetEnv(t, "K_SERVICE", "K_REVISION", "K_CONFIGURATION")
-	t.Setenv("GOOGLE_CLOUD_PROJECT", "test-project")
-	t.Setenv("DB_URL", "postgres://localhost/x")
-
-	type MyEnv struct {
-		cloudrun.Env
-		DBURL string `env:"DB_URL,notEmpty"`
-	}
-
-	var got MyEnv
-	if err := env.Parse(&got); err != nil {
-		t.Fatalf("env.Parse: %v", err)
-	}
-	if got.Project != "test-project" {
-		t.Errorf("Project: got %q, want test-project", got.Project)
-	}
-	if got.DBURL != "postgres://localhost/x" {
-		t.Errorf("DBURL: got %q", got.DBURL)
-	}
-}
-
-func TestResolveProjectID_PrefersEnvVar(t *testing.T) {
-	// If the env var is set, we should not hit the metadata server.
-	// We point GCE_METADATA_HOST at a server that would fail the test
-	// if it were ever called.
+	t.Setenv("GOOGLE_CLOUD_PROJECT", "from-env")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("unexpected metadata server hit: %s", r.URL.Path)
 		http.Error(w, "should not be called", http.StatusInternalServerError)
@@ -113,43 +119,38 @@ func TestResolveProjectID_PrefersEnvVar(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Setenv("GCE_METADATA_HOST", strings.TrimPrefix(srv.URL, "http://"))
 
-	e := &cloudrun.Env{Project: "from-env"}
-	if err := cloudrun.ResolveProjectID(context.Background(), e); err != nil {
-		t.Fatalf("ResolveProjectID: %v", err)
+	got, err := cloudrun.LoadEnv(context.Background())
+	if err != nil {
+		t.Fatalf("LoadEnv: %v", err)
 	}
-	if e.Project != "from-env" {
-		t.Errorf("Project: got %q, want from-env", e.Project)
-	}
-}
-
-func TestResolveProjectID_FallsBackToMetadata(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The GCP metadata client requires this header on every request.
-		if r.Header.Get("Metadata-Flavor") != "Google" {
-			http.Error(w, "missing Metadata-Flavor header", http.StatusBadRequest)
-			return
-		}
-		switch r.URL.Path {
-		case "/computeMetadata/v1/project/project-id":
-			w.Header().Set("Metadata-Flavor", "Google")
-			w.Write([]byte("from-metadata"))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	t.Setenv("GCE_METADATA_HOST", strings.TrimPrefix(srv.URL, "http://"))
-
-	e := &cloudrun.Env{}
-	if err := cloudrun.ResolveProjectID(context.Background(), e); err != nil {
-		t.Fatalf("ResolveProjectID: %v", err)
-	}
-	if e.Project != "from-metadata" {
-		t.Errorf("Project: got %q, want from-metadata", e.Project)
+	if got.Project != "from-env" {
+		t.Errorf("Project: got %q, want from-env", got.Project)
 	}
 }
 
-// Note: there is intentionally no test for the "metadata unreachable" path.
-// cloud.google.com/go/compute/metadata caches successful project-ID lookups
-// in a package-global, making such a test order-dependent across the suite.
-// The error path in ResolveProjectID is a one-line wrap; verified by reading.
+func TestLoadEnv_PartialRuntimeVarsErrors(t *testing.T) {
+	// K_SERVICE alone (without K_REVISION, K_CONFIGURATION) is a misconfigured
+	// environment — must error rather than produce a half-populated Runtime.
+	unsetEnv(t, "K_REVISION", "K_CONFIGURATION")
+	t.Setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+	t.Setenv("K_SERVICE", "my-service")
+
+	_, err := cloudrun.LoadEnv(context.Background())
+	if err == nil {
+		t.Fatal("LoadEnv: got nil error; expected error for partial K_* vars")
+	}
+	if !strings.Contains(err.Error(), "partial Cloud Run runtime variables") {
+		t.Errorf("error should describe partial-vars condition; got: %v", err)
+	}
+}
+
+func TestLoadEnv_InvalidPortErrors(t *testing.T) {
+	unsetEnv(t, "K_SERVICE", "K_REVISION", "K_CONFIGURATION")
+	t.Setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+	t.Setenv("PORT", "not-a-number")
+
+	_, err := cloudrun.LoadEnv(context.Background())
+	if err == nil {
+		t.Fatal("LoadEnv: got nil error; expected error for invalid PORT")
+	}
+}
